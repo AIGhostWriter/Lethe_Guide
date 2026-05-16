@@ -1,6 +1,6 @@
 # Chapter 4 — Full Sample: Soji Abi (소지아비)
 
-> A complete boss mod walkthrough. Every file shown is the actual file used.
+> A complete boss mod built from scratch. Every file shown is the actual file used.
 
 *Previous: [Chapter 3 — Advanced Lua](./chapter3_EN.md)*
 
@@ -8,41 +8,88 @@
 
 ## Table of Contents
 
-1. [Concept and ID Scheme](#1-concept-and-id-scheme)
-2. [Mod Folder Structure](#2-mod-folder-structure)
-3. [Registering the Encounter](#3-registering-the-encounter)
-4. [Boss Unit](#4-boss-unit)
-5. [Skills](#5-skills)
-6. [Custom Passive](#6-custom-passive)
-7. [Pattern Design](#7-pattern-design)
-8. [Lua — 광역 난사 (Area Barrage)](#8-lua--광역-난사-area-barrage)
+1. [Game Data Acquisition](#1-game-data-acquisition)
+2. [Custom Encounter Setup](#2-custom-encounter-setup)
+3. [Custom Skills](#3-custom-skills)
+4. [Lua — 광역 난사 (Area Barrage)](#4-lua--광역-난사-area-barrage)
 
 ---
 
-## 1. Concept and ID Scheme
+## 1. Game Data Acquisition
 
-Soji Abi is a 7-slot sword-fighter boss built around two keywords:
+Before writing any mod files, several values must be pulled from `dumpedData`. These values cannot be invented — they must match strings and IDs already present in the game.
 
-| Keyword | Applied to | Role |
-|---|---|---|
-| `Breath` (호흡) | Self | Power resource — accumulates every hit |
-| `PhantomIncision` (잔상) | Target | Mark for follow-up damage |
+### What was found and where
 
-The climax skill **광역 난사** (682001200) fires 9 coins in a row, each exploding and reloading Vibration stacks.
+**Appearance string**
 
-**ID scheme:**
+Located in `dumpedData/` under the identities section for character 1322:
+
+```
+1322_Pinky_Father2pAppearance
+```
+
+This string is a key into the game's character asset system. It maps to a specific 3D model, skeleton rig, and animation clip set. All `changemotion()` calls in Lua reference motion names (`"S1"`, `"S2"`, `"S3"`, etc.) that exist within this rig — if the appearance string is wrong, the rig will not have those motion names and animation calls will fail silently.
+
+**Unit script ID**
+
+Found by looking at an existing boss that shares the same movement and AI behavior:
+
+```
+8380
+```
+
+This integer is a key into the game's internal AI script table. The script defines the boss's pathfinding behavior, between-turn repositioning, and idle animation state. It is not a filename — it is a lookup ID. Copying it from a boss that uses the same character rig ensures compatible movement behavior.
+
+**Map name and BGM**
+
+Found inside `dumpedData/` encounter files:
+
+```
+mapName: "Cp9_HouseSpidersRoooftop"
+bgmList: ["Battle_Cp9_Boss_5", "Battle_Cp9_Boss_6"]
+```
+
+`mapName` is a scene asset name loaded by the engine at encounter start. `bgmList` accepts multiple entries — the engine transitions from the first track to the second at a defined encounter threshold. Both strings must exactly match asset names registered in the game.
+
+**Spawn position IDs**
+
+Copied from an existing encounter using the same map:
+
+```
+allyPositionID:  175
+enemyPositionID: 164
+```
+
+Each map has a set of predefined spawn point definitions identified by integer IDs. Using an ID that does not exist on the selected map will cause units to spawn at the origin or not at all.
+
+**Base-game passive IDs**
+
+Character 1322's passive set found in `dumpedData/`:
+
+```
+132219, 132224, 132220, 132222, 132223, 132214, 132230, 9999998
+```
+
+These passive IDs reference records that already exist in the game's passive database. They require no custom JSON files — the engine loads them from its own data. They are copied into `passiveSet.passiveIdList` in `soji.json` alongside the single custom passive `6820901`.
+
+### ID scheme
+
+All custom IDs were assigned to avoid collision with base-game data:
 
 ```
 encounter:   682001
 unit:        6820001
 part:        6820101
 passive:     6820901
-skills:      682001010 … 682001200   (steps of 10)
+skills:      682001010 … 682001200   (increments of 10)
 ```
 
 ---
 
-## 2. Mod Folder Structure
+## 2. Custom Encounter Setup
+
+### Folder structure
 
 ```
 BepInEx/plugins/Lethe/mods/
@@ -71,10 +118,6 @@ BepInEx/plugins/Lethe/mods/
         ├── SojiBarrage.lua
         └── SojiPattern.lua
 ```
-
----
-
-## 3. Registering the Encounter
 
 ### encounter.json
 
@@ -114,11 +157,13 @@ BepInEx/plugins/Lethe/mods/
 | Field | Notes |
 |---|---|
 | `id` | Must match `subchapterId` and `nodeId` in `subchapterui.json` |
-| `stageType` | `"Abnormality"` for a boss fight |
-| `mapName` | Spider House rooftop — picked from existing map names in `dumpedData/encounters/` |
-| `bgmList` | Two tracks — the second activates mid-fight |
-| `allyPositionID` / `enemyPositionID` | Spawn positions; values copied from a similar existing encounter |
-| `staminaCost: 0` | Free to enter — standard for sandbox mods |
+| `stageType` | `"Abnormality"` activates boss-fight logic and the abnormality unit loading path |
+| `isBatonPassOn` | Enables baton pass between identities mid-fight |
+| `mapName` | Scene asset name — must exist in the game's asset registry |
+| `bgmList` | Two-track — engine transitions to the second track at the encounter's midpoint threshold |
+| `unitID` | Must match `id` in `soji.json` |
+| `staminaCost` | 0 = free to enter |
+| `effectiveResistCondition` | The resist multiplier is applied when the attacker's power-to-defense ratio exceeds this value |
 
 ### subchapterui.json
 
@@ -141,13 +186,9 @@ BepInEx/plugins/Lethe/mods/
 }
 ```
 
-`subchapterId` and `nodeId` must both equal `encounter.json`'s `id`. `timeLine: "PLAYGROUND"` places the node in the Playground area, which is always accessible.
+`subchapterId` and `nodeId` must both equal `encounter.json`'s `id` — the engine uses these three values together to resolve the encounter when the node is selected. `timeLine: "PLAYGROUND"` places the node in the Playground area, which is always accessible regardless of story progression.
 
----
-
-## 4. Boss Unit
-
-### abnormality-unit — soji.json (key sections)
+### soji.json (abnormality-unit)
 
 ```json
 {
@@ -160,10 +201,7 @@ BepInEx/plugins/Lethe/mods/
     "startActionSlotNum": 7,
     "maxActionSlotNum": 7,
     "specialDuelRank": 5,
-    "hp": {
-      "defaultStat": 532,
-      "incrementByLevel": 18
-    },
+    "hp": { "defaultStat": 532, "incrementByLevel": 18 },
     "unitKeywordList": ["SMALL", "FINGER", "LITTLE_FINGER_FATHER_ENEMY"],
     "associationList": ["LITTLE_FINGER", "SPIDER_HOUSE"],
     "patternID": "PickByPattern_Abnormality_UptoActionSlotCnt",
@@ -199,24 +237,34 @@ BepInEx/plugins/Lethe/mods/
     "passiveSet": {
       "passiveIdList": [132219, 132224, 132220, 132222, 132223, 132214, 132230, 9999998, 6820901]
     },
-    "patternList": [ /* see Section 7 */ ]
+    "patternList": [ /* 6 patterns */ ]
   }]
 }
 ```
 
 | Field | Notes |
 |---|---|
-| `appearance` | Copied from `dumpedData/identities/` for character 1322 |
-| `unitScriptID` | AI script — copied from a reference boss using the same rig |
-| `startActionSlotNum` | Skills per turn. Never set to `999` — always an explicit number |
-| `abnormalityPartList` | Must match the `id` in `soji_part.json` |
-| `attributeList` | Every skill the boss can use must be listed here. `"number": 0` is correct for boss units |
-| `passiveSet` | IDs `132219`–`132230` and `9999998` are copied from the reference character. `6820901` is the custom passive |
-| `mentalConditionInfo` | Controls morale gain/loss on clash win/loss — copied from a similar existing boss |
+| `appearance` | Asset key for the character model, rig, and animation clip set |
+| `classType` | Boss threat tier — affects UI display and certain game system calculations |
+| `attributeType` | The unit's primary sin attribute — used for damage type matching and resistance calculations |
+| `unitScriptID` | Integer key into the AI script table — controls movement and idle behavior |
+| `startActionSlotNum` | Number of skill slots active at encounter start |
+| `maxActionSlotNum` | Maximum skill slots the boss can have (set equal to `startActionSlotNum` for a fixed slot count) |
+| `specialDuelRank` | The boss's clash power tier. Higher values cause the boss to win clashes against lower-ranked units more frequently |
+| `hp.incrementByLevel` | HP added per level above the base level |
+| `patternID` | `PickByPattern_Abnormality_UptoActionSlotCnt` — selects patterns from `patternList` up to the count of active action slots |
+| `hasMp` | Enables the stagger/MP system — the boss has a stagger bar that can be broken |
+| `panicType` | Determines the panic animation and behavior state when the boss's SP reaches 0 |
+| `abnormalityPartList` | List of part IDs attached to this unit. Must match `id` values in `soji_part.json` |
+| `attributeList` | Every skill the boss may use across all patterns must be listed here. `"number": 0` is correct for boss units — bosses do not consume sin resources |
+| `passiveSet` | IDs `132219`-`132230` and `9999998` are base-game passives from dumpedData. `6820901` is the custom Lua-trigger passive |
 
-> The passive IDs `132219`–`132230` and `9999998` are base-game passives. They require no custom files — they already exist in the game data.
+**`mentalConditionInfo`** controls SP (sanity) gain and loss on clash outcomes. The `add` list fires on SP gain events (winning a duel), `min` fires on SP loss events (losing a duel). The condition ID encodes the formula directly in its name:
 
-### abnormality-part — soji_part.json
+- `OnWinDuelAsParryingCountMultiply10AndPlus20Percent` — SP gain = (parry count × 10 + 20)%
+- `OnLoseDuelAsParryingCountMultiply3AndPlus10Percent` — SP loss = (parry count × 3 + 10)%
+
+### soji_part.json (abnormality-part)
 
 ```json
 {
@@ -251,9 +299,44 @@ BepInEx/plugins/Lethe/mods/
 }
 ```
 
-The part `id` (`6820101`) must match `abnormalityPartList` in `soji.json`. Resistance values: `< 1.0` = weak, `1.0` = normal, `> 1.0` = resistant.
+The part `id` (`6820101`) must match the value in `abnormalityPartList` in `soji.json`. `isDestroyable: "false"` means the part's HP bar can reach 0 but does not trigger a destruction event — the encounter continues. `spreadMpEffectToAbnormality: "true"` propagates MP (stagger) damage applied to the part up to the main abnormality unit, so hitting the part also fills the main unit's stagger gauge.
 
-### Locale — soji_locale.json
+Resistance values: `< 1.0` weak (damage multiplied up), `1.0` normal, `> 1.0` resistant (damage multiplied down). `WHITE` and `BLACK` at `2.0` means those attribute types deal half effective damage.
+
+### SojiPassive.json
+
+```json
+{
+  "list": [
+    {
+      "id": 6820901,
+      "attributeStockCondition": [],
+      "requireIDList": [
+        "Modular/TIMING:AfterSlots/LUA:SojiPattern/LUAMAIN:onSkillUse"
+      ]
+    }
+  ]
+}
+```
+
+This passive has no stat effects. Its only function is to register a Lua trigger through `requireIDList`. The string is parsed by Lethe's ModularSkillScripts system:
+
+```
+Modular / TIMING:AfterSlots / LUA:SojiPattern / LUAMAIN:onSkillUse
+  │              │                  │                    │
+  │              │                  │                    └─ Function name to call in the file
+  │              │                  └─ Lua file: modular_lua/SojiPattern.lua
+  │              └─ Timing: fires after skill slots are assigned, before skills execute
+  └─ ModularSkillScripts system prefix
+```
+
+`AfterSlots` fires once per round after the pattern selector assigns skills to slots, before any skill begins executing. This is the only timing window in which `skillslotreplace()` is effective — after this point, slot assignments are locked.
+
+The passive is active because its ID (`6820901`) is listed in `passiveSet.passiveIdList` in `soji.json`.
+
+### Locale
+
+**soji_locale.json** (`custom_limbus_locale/KR/enemyList/`):
 
 ```json
 {
@@ -266,35 +349,37 @@ The part `id` (`6820101`) must match `abnormalityPartList` in `soji.json`. Resis
 }
 ```
 
-The top-level key is the unit ID as a string. This format is specific to `enemyList` — do not use the `dataList` array format used for buffs.
+The top-level key is the unit ID as a string. This format is specific to `enemyList` locale files — do not use the `dataList` array format used for other locale types.
+
+**soji_skills_locale.json** (`custom_limbus_locale/KR/skillList/`):
+
+```json
+{
+  "682001020": {
+    "id": "682001020",
+    "levelList": [{
+      "level": 1,
+      "name": "이연잔",
+      "desc": "[적중시] 호흡 1 획득.",
+      "coinlist": [
+        { "coindescs": [{ "desc": "[적중시] 호흡 +1", "summary": "" }] },
+        { "coindescs": [{ "desc": "[적중시] 호흡 +1", "summary": "" }] },
+        { "coindescs": [{ "desc": "[적중시] 호흡 +1", "summary": "" }] },
+        { "coindescs": [{ "desc": "[적중시] 호흡 +1", "summary": "" }] },
+        { "coindescs": [{ "desc": "[적중시] 호흡 +1", "summary": "" }] }
+      ]
+    }]
+  }
+}
+```
+
+`coinlist` must have exactly as many entries as the skill has coins — the engine maps each entry by index to its corresponding coin. A mismatch in count causes coin descriptions to display incorrectly or not at all.
 
 ---
 
-## 5. Skills
+## 3. Custom Skills
 
-All 15 skills are in `custom_limbus_data/skill/soji_skills.json`.
-
-### 5-1. Skill List
-
-| ID | Name | Coins | Sin | Key mechanic |
-|---|---|---|---|---|
-| 682001010 | 연격 | 4 | VIOLET | Breath per hit; AoE 5 targets |
-| 682001020 | 이연잔 | 5 | VIOLET | Breath per hit; anchor skill in every pattern |
-| 682001030 | 잔상베기 | 1 | INDIGO | SuperCoin; Breath +5 if one-sided; PhantomIncision |
-| 682001040 | 폭압격 | — | INDIGO | Forced clash; target count reacts to duel result |
-| 682001060 | 잔상 해방 | — | INDIGO | PhantomIncision burst |
-| 682001080 | 사냥 | — | INDIGO | — |
-| 682001100 | 처형 | — | INDIGO | Heavy execution |
-| 682001110 | 공진 | — | INDIGO | Vibration |
-| 682001130 | 이연속참 | — | VIOLET | Breath + chain |
-| 682001140 | 필연쇄 | — | INDIGO | — |
-| 682001160 | 호흡 강탈 | — | INDIGO | Breath drain |
-| 682001170 | 정신 압박 | — | INDIGO | — |
-| 682001180 | 취약 유도 | — | INDIGO | — |
-| 682001190 | 취약 강타 | — | INDIGO | — |
-| 682001200 | 광역 난사 | 9 | VIOLET | VibrationExplosion + Vibration 5/5 on all 9 coins |
-
-### 5-2. Basic Skill Structure — 연격 (682001010)
+### 3-1. 연격 (682001010)
 
 ```json
 {
@@ -323,19 +408,31 @@ All 15 skills are in `custom_limbus_data/skill/soji_skills.json`.
     ],
     "coinList": [
       {
-        "operatorType": "ADD",
-        "scale": 4,
+        "operatorType": "ADD", "scale": 4,
         "abilityScriptList": [
           { "scriptName": "GiveBuffOnSucceedAttack",
             "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
           { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s1_frame0" }
         ]
       },
-      { /* coin[1] — identical to coin[0] */ },
-      { /* coin[2] — identical to coin[0] */ },
       {
-        "operatorType": "ADD",
-        "scale": 7,
+        "operatorType": "ADD", "scale": 4,
+        "abilityScriptList": [
+          { "scriptName": "GiveBuffOnSucceedAttack",
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s1_frame0" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 4,
+        "abilityScriptList": [
+          { "scriptName": "GiveBuffOnSucceedAttack",
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s1_frame0" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 7,
         "abilityScriptList": [
           { "scriptName": "GiveBuffOnSucceedAttack",
             "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 2, "turn": 0 } },
@@ -347,53 +444,101 @@ All 15 skills are in `custom_limbus_data/skill/soji_skills.json`.
 }
 ```
 
-**Top-level `abilityScriptList`** — fires when the skill is selected, before any coins:
+**Core fields:**
 
-- `EmptyBody` — required on every boss skill. Declares a boss-type attack body.
-- `GiveBuffOnUse` with `stack: 0, turn: 2` — `stack: 0` does **not** add stacks. It refreshes the Breath buff's remaining duration to 2 turns without changing the current count. This keeps Breath alive across rounds.
+| Field | Value | Effect |
+|---|---|---|
+| `defType` | `"ATTACK"` | Damage is calculated using the unit's attack stat. `"DEFENSE"` would use the defense stat instead |
+| `targetNum` | 5 | Number of hit instances distributed across targets |
+| `skillTargetType` | `"RANDOM"` | Hits are distributed randomly among available targets |
+| `skillLevelCorrection` | 0 | Additional base power added per unit level. `0` means power scales only from level-based stat growth |
+| `defaultValue` | 10 | Base coin power before `scale` is added |
+| `parryingCloseType` | `"NEAR"` | The skill can only target units in the near range — affects clash eligibility |
+| `canDuel` | true | This skill can enter clash resolution against opposing skills |
+| `viewType` | `"ENCOUNTER"` | Camera pulls back to show all units. Use `"BATTLE"` for single-target clashes |
+
+**Top-level `abilityScriptList`** — fires once when the skill is selected, before any coin resolves:
+
+- `EmptyBody` — required declaration on every boss skill. Without it the attack body is undefined and the skill will not execute correctly.
+- `GiveBuffOnUse` with `stack: 0, turn: 2` — `stack: 0` does not add stacks. It only refreshes the Breath buff's remaining duration to 2 turns. The current stack count is preserved.
 
 **Coins:**
 
-| Coin | `scale` | Effect |
-|---|---|---|
-| [0] [1] [2] | 4 | Breath +1; plays S1 frame 0 |
-| [3] | 7 | Breath +2; plays S1 frame 1 (finishing animation) |
+| Coin | `scale` | Motion | Breath on hit |
+|---|---|---|---|
+| [0] [1] [2] | 4 | S1 frame 0 | +1 |
+| [3] | 7 | S1 frame 1 | +2 |
 
-`viewType: "ENCOUNTER"` zooms the camera out to show all units — use this for AoE skills. Use `"BATTLE"` for single-target clashes.
+`operatorType: "ADD"` means each coin adds its `scale` to the running power total. The total at the time the coin resolves is the final attack power for that hit. `GiveBuffOnSucceedAttack` with `turn: 0` means the Breath buff has no turn-based expiry — it persists until removed by another effect.
 
-### 5-3. Conditional Scripts — 잔상베기 (682001030)
+---
+
+### 3-2. 이연잔 (682001020)
 
 ```json
 {
-  "id": 682001030,
-  "skillTier": 2,
+  "id": 682001020,
+  "skillTier": 1,
+  "skillType": "SKILL",
   "skillData": [{
-    "attributeType": "INDIGO",
-    "defaultValue": 14,
-    "skillLevelCorrection": 3,
-    "skillMotion": "S3",
-    "viewType": "ENCOUNTER",
+    "attributeType": "VIOLET",
+    "atkType": "SLASH",
+    "defType": "ATTACK",
+    "targetNum": 1,
+    "skillTargetType": "RANDOM",
+    "canDuel": true,
+    "canChangeTarget": true,
+    "skillLevelCorrection": 0,
+    "defaultValue": 10,
+    "skillMotion": "S2",
+    "viewType": "BATTLE",
+    "parryingCloseType": "NEAR",
     "abilityScriptList": [
       { "scriptName": "EmptyBody" },
       {
-        "scriptName": "GiveBuffBeforeAttackIfOnesideAttack",
-        "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 5, "turn": 0 }
-      },
-      { "scriptName": "TagetNumAdderOnLoseDuel", "value": -2 }
+        "scriptName": "GiveBuffOnUse",
+        "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 0, "turn": 3 }
+      }
     ],
     "coinList": [
       {
-        "operatorType": "ADD",
-        "grade": 2,
-        "color": "GREY",
-        "scale": 9,
+        "operatorType": "ADD", "scale": 3,
         "abilityScriptList": [
-          { "scriptName": "SuperCoin" },
-          { "scriptName": "CriticalDmgUpByJsonValue", "value": 0.3 },
           { "scriptName": "GiveBuffOnSucceedAttack",
-            "buffData": { "buffKeyword": "PhantomIncision", "target": "Target", "stack": 1, "turn": 0 } },
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s2_frame1" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 3,
+        "abilityScriptList": [
           { "scriptName": "GiveBuffOnSucceedAttack",
-            "buffData": { "buffKeyword": "PhantomIncision", "target": "Target", "stack": 1, "turn": 0 } }
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s2_frame1" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 3,
+        "abilityScriptList": [
+          { "scriptName": "GiveBuffOnSucceedAttack",
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s2_frame2" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 3,
+        "abilityScriptList": [
+          { "scriptName": "GiveBuffOnSucceedAttack",
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s2_frame1" }
+        ]
+      },
+      {
+        "operatorType": "ADD", "scale": 3,
+        "abilityScriptList": [
+          { "scriptName": "GiveBuffOnSucceedAttack",
+            "buffData": { "buffKeyword": "Breath", "target": "Self", "stack": 1, "turn": 0 } },
+          { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s2_frame2" }
         ]
       }
     ]
@@ -401,190 +546,72 @@ All 15 skills are in `custom_limbus_data/skill/soji_skills.json`.
 }
 ```
 
+5 coins, all `scale: 3`. Each coin grants Breath +1 on hit. Unlike 682001010, this skill uses `viewType: "BATTLE"` because `targetNum: 1` makes it a single-target clash skill — the camera stays in close-up.
+
+`GiveBuffOnUse` at top level with `stack: 0, turn: 3` refreshes Breath duration to 3 turns on selection without adding stacks — the same duration-refresh pattern used in 682001010.
+
+The S2 animation has 3 frames. Coins call `s2_frame1` or `s2_frame2` from `SojiMotion.lua` at `TIMING:ChangeMotion`:
+
+| Coin | Motion |
+|---|---|
+| [0] [1] [3] | S2 frame 1 |
+| [2] [4] | S2 frame 2 |
+
+---
+
+### 3-3. 광역 난사 (682001200)
+
+```json
+{
+  "id": 682001200,
+  "skillTier": 3,
+  "skillType": "SKILL",
+  "skillData": [{
+    "attributeType": "INDIGO",
+    "atkType": "SLASH",
+    "defType": "ATTACK",
+    "targetNum": 5,
+    "skillTargetType": "RANDOM",
+    "canDuel": true,
+    "canChangeTarget": true,
+    "skillLevelCorrection": 4,
+    "defaultValue": 9,
+    "importanceLevel": 3,
+    "skillMotion": "S1",
+    "viewType": "ENCOUNTER",
+    "parryingCloseType": "NEAR",
+    "abilityScriptList": [
+      { "scriptName": "EmptyBody" },
+      { "scriptName": "DealRandomTargetAmongTargetsMTFirst" },
+      { "scriptName": "CanBeChangedTargetIgnoreSpeedIfEnemy" },
+      { "scriptName": "Modular/TIMING:BeforeUse/makeunbreakable(1)" }
+    ],
+    "coinList": [
+      /* coins [0]-[6]: barrageRandomS2 */
+      /* coin  [7]:     s6_frame0       */
+      /* coin  [8]:     s3_frame0, Unbreakable, Breath reward */
+    ]
+  }]
+}
+```
+
 **Top-level scripts:**
 
-| Script | When it fires | Effect |
-|---|---|---|
-| `GiveBuffBeforeAttackIfOnesideAttack` | Before attack, only if no clash | Grants Breath +5. Fires only when the player left this slot uncontested |
-| `TagetNumAdderOnLoseDuel` `value: -2` | After losing a duel | Target count −2. Rewards the player for contesting |
-
-**The single coin:**
-
-```
-grade: 2 + color: "GREY"        → Unbreakable — fires even when the player wins the clash
-SuperCoin                        → Coin flip always Heads — full power always applies
-CriticalDmgUpByJsonValue 0.3     → +30% critical hit damage
-GiveBuffOnSucceedAttack ×2       → 2 separate entries = 2 PhantomIncision stacks applied sequentially
-```
-
-### 5-4. abilityScript Reference
-
-**Top-level (fires on skill selection):**
-
 | Script | Effect |
 |---|---|
-| `EmptyBody` | Required on every boss skill |
-| `GiveBuffOnUse` | Apply buff on selection. `stack: 0` = duration refresh only |
-| `GiveBuffBeforeAttackIfOnesideAttack` | Buff granted before attack if no clash occurs |
-| `TagetNumAdderOnLoseDuel` | Adjusts target count when boss loses a duel |
+| `EmptyBody` | Required boss attack body declaration |
+| `DealRandomTargetAmongTargetsMTFirst` | Distributes 9 hit instances across available targets. Prioritizes targets that are already being targeted by the most allies (MT = most-targeted first), spreading pressure efficiently across the team |
+| `CanBeChangedTargetIgnoreSpeedIfEnemy` | Normally, target switching during skill resolution is gated by the unit's speed stat. This script removes that restriction, allowing the boss to redirect hits to any target freely regardless of speed order |
+| `makeunbreakable(1)` at `BeforeUse` | The integer parameter specifies how many coins from the end of the skill become Unbreakable. `makeunbreakable(1)` makes the final coin (coin 8) unbreakable |
 
-**Per-coin (fires on each coin):**
+`importanceLevel: 3` marks this as a high-priority skill for the AI's slot assignment logic. `skillLevelCorrection: 4` adds 4 base power per unit level, making the skill significantly stronger at higher levels than skills with `skillLevelCorrection: 0`.
 
-| Script | Effect |
-|---|---|
-| `SuperCoin` | Coin flip always Heads |
-| `GiveBuffOnSucceedAttack` | Apply buff on successful hit |
-| `VibrationExplosionOnSucceedAttack` | Detonate current Vibration stacks on target |
-| `CriticalDmgUpByJsonValue` | Multiply critical damage by `1 + value` |
-
-### 5-5. Skill Locale — soji_skills_locale.json
-
-```json
-{
-  "682001030": {
-    "id": "682001030",
-    "levelList": [{
-      "level": 1,
-      "name": "잔상베기",
-      "desc": "[일방적 공격 시] 호흡 5 획득. [결투 패배 시] 공격 대상 수 -2.",
-      "coinlist": [{
-        "coindescs": [
-          { "desc": "[파괴불가] 치명타 피해 +30%, [적중시] 잔상 1 부여, [결투 승리 시] 잔상 1 추가 부여", "summary": "" }
-        ]
-      }]
-    }]
-  }
-}
-```
-
-`coindescs` must have **exactly as many entries as the skill has coins**. 잔상베기 has 1 coin → 1 entry. 광역 난사 has 9 coins → 9 entries.
-
----
-
-## 6. Custom Passive
-
-`custom_limbus_data/passive/SojiPassive.json`:
-
-```json
-{
-  "list": [
-    {
-      "id": 6820901,
-      "attributeStockCondition": [],
-      "requireIDList": [
-        "Modular/TIMING:AfterSlots/LUA:SojiPattern/LUAMAIN:onSkillUse"
-      ]
-    }
-  ]
-}
-```
-
-This passive has no stat effects. Its only role is to fire the Lua pattern controller once per round.
-
-**`requireIDList` string breakdown:**
-
-```
-Modular / TIMING:AfterSlots / LUA:SojiPattern / LUAMAIN:onSkillUse
-  │              │                  │                    │
-  │              │                  │                    └─ Function to call
-  │              │                  └─ modular_lua/SojiPattern.lua
-  │              └─ Fires after slots are assigned, before skills execute
-  └─ ModularSkillScripts system
-```
-
-`AfterSlots` is the only timing where `skillslotreplace()` is effective. Skills are assigned but not yet executing — slots can still be overridden.
-
-The passive is activated by listing its ID in `passiveSet` inside `soji.json`:
-
-```json
-"passiveSet": {
-  "passiveIdList": [132219, 132224, 132220, 132222, 132223, 132214, 132230, 9999998, 6820901]
-}
-```
-
----
-
-## 7. Pattern Design
-
-### patternList Structure
-
-Each entry in `patternList` defines one round of skills (7 slots):
-
-```json
-"patternID": "PickByPattern_Abnormality_UptoActionSlotCnt",
-"patternList": [
-  {
-    "slotList": [
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001200, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001030, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001110, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001100, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001140, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001060, "chance": 1}], "chance": 1}]},
-      {"skillParentList": [{"skillChildList": [{"skillID": 682001020, "chance": 1}], "chance": 1}]}
-    ]
-  }
-  /* 5 more patterns ... */
-]
-```
-
-A single slot written compactly:
-
-```json
-{"skillParentList": [{"skillChildList": [{"skillID": 682001200, "chance": 1}], "chance": 1}]}
-```
-
-The nested structure supports weighted random selection per slot. `chance: 1` makes it deterministic.
-
-### Lua Override
-
-The `patternList` in this mod acts as a **fallback only**. The Lua script `SojiPattern.lua` overrides all 7 slots every round at `AfterSlots` timing using a 3-cycle rotation:
-
-| Cycle | Rounds | Focus | Slot 0 |
-|---|---|---|---|
-| Cycle 1 | 1, 4, 7… | Area barrage + heavy pressure | 682001200 always |
-| Cycle 2 | 2, 5, 8… | Breath accumulation | 682001020 / 682001140 |
-| Cycle 3 | 3, 6, 9… | PhantomIncision pressure | 682001110 / 682001040 |
-
-All `patternList` entries have 682001200 in slot 0 as a safe default in case the Lua override does not run.
-
----
-
-## 8. Lua — 광역 난사 (Area Barrage)
-
-<video src="https://github.com/AIGhostWriter/Lethe_Guide/raw/main/KakaoTalk_20260516_162012462.mp4" controls width="100%"></video>
-
-### 8-1. Why Lua Is Needed Here
-
-`광역 난사` (682001200) has 9 coins. The S2 animation has 3 frames. Coins 0–6 should play a random frame each hit. JSON has no `random()` function — Lua is required.
-
-### 8-2. SojiBarrage.lua
-
-```lua
--- SojiBarrage.lua
--- Picks a random S2 frame (0, 1, or 2) for each hit on coins 0–6.
--- Called at TIMING:ChangeMotion — fires for all coins including SuperCoins.
-
-function barrageRandomS2()
-    local frame = random(0, 2)
-    changemotion("S2", frame)
-    log("[SojiBarrage] S2[" .. frame .. "]", 0)
-end
-```
-
-> `changemotion(motionName, frameIndex)` — changes the animation frame playing for this coin. Only valid at `TIMING:ChangeMotion`.  
-> `random(0, 2)` — returns 0, 1, or 2 with equal probability (inclusive on both ends).
-
-### 8-3. Wiring Lua to Each Coin
-
-**Coins 0–6** call `barrageRandomS2` for a random S2 frame:
+**Coins [0]-[6] — random S2 frame via Lua:**
 
 ```json
 {
   "operatorType": "ADD",
-  "grade": 2,
-  "color": "GREY",
-  "scale": 6,
+  "scale": 4,
   "abilityScriptList": [
     { "scriptName": "SuperCoin" },
     { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiBarrage/LUAMAIN:barrageRandomS2" },
@@ -595,11 +622,12 @@ end
 }
 ```
 
-**Coin 7** switches to a fixed S6 frame:
+**Coin [7] — fixed S6 frame:**
 
 ```json
 {
-  "operatorType": "ADD", "grade": 2, "color": "GREY", "scale": 6,
+  "operatorType": "ADD",
+  "scale": 4,
   "abilityScriptList": [
     { "scriptName": "SuperCoin" },
     { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s6_frame0" },
@@ -610,11 +638,14 @@ end
 }
 ```
 
-**Coin 8** (final blow) — S3 frame, plus Breath reward for the boss:
+**Coin [8] — Unbreakable final blow:**
 
 ```json
 {
-  "operatorType": "ADD", "grade": 2, "color": "GREY", "scale": 6,
+  "operatorType": "ADD",
+  "scale": 7,
+  "grade": 2,
+  "color": "GREY",
   "abilityScriptList": [
     { "scriptName": "SuperCoin" },
     { "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiMotion/LUAMAIN:s3_frame0" },
@@ -627,33 +658,65 @@ end
 }
 ```
 
-### 8-4. The Vibration Chain
+`grade: 2, color: "GREY"` is the JSON-level declaration for the Unbreakable visual marker — it makes the coin render as a grey Unbreakable coin in the UI. The actual unbreakable behavior is enforced by `makeunbreakable(1)` at `BeforeUse`. Coin 8 has `scale: 7` (vs `scale: 4` on the others), making its power contribution higher. It also grants Breath +3 to self on hit — the boss recovers Breath after completing the full barrage.
 
-Every coin runs the same sequence:
+---
+
+## 4. Lua — 광역 난사 (Area Barrage)
+
+<video src="https://github.com/AIGhostWriter/Lethe_Guide/raw/main/KakaoTalk_20260516_162012462.mp4" controls width="100%"></video>
+
+### 4-1. Why Lua Is Needed
+
+`광역 난사` (682001200) has 9 coins. The S2 animation has 3 frames. Coins 0-6 each play a randomly selected frame per hit. JSON has no `random()` function — Lua is required.
+
+### 4-2. SojiBarrage.lua
+
+```lua
+function barrageRandomS2()
+    local frame = random(0, 2)
+    changemotion("S2", frame)
+    log("[SojiBarrage] S2[" .. frame .. "]", 0)
+end
+```
+
+- `random(0, 2)` — Lethe's built-in RNG function. Returns an integer in the range [0, 2] inclusive with uniform distribution. Called fresh each coin, so each of the 7 coins gets an independent random frame.
+- `changemotion(motionName, frameIndex)` — sets the animation clip frame for the currently resolving coin. `"S2"` is the motion name within the appearance rig. This function is only valid at `TIMING:ChangeMotion` — calls outside this timing are ignored.
+
+Each of coins 0-6 registers this function as a `ChangeMotion` script in its `abilityScriptList`:
+
+```json
+{ "scriptName": "Modular/TIMING:ChangeMotion/LUA:SojiBarrage/LUAMAIN:barrageRandomS2" }
+```
+
+The Lethe ModularSkillScripts system parses this string: `LUA:SojiBarrage` resolves to `modular_lua/SojiBarrage.lua`, and `LUAMAIN:barrageRandomS2` calls the function `barrageRandomS2` in that file. Coins 7 and 8 use fixed functions from `SojiMotion.lua` (`s6_frame0`, `s3_frame0`) instead of the random function.
+
+
+### 4-3. The Vibration Chain
+
+Every coin executes the same four-step sequence. The order within `abilityScriptList` is the execution order:
 
 ```
-① SuperCoin                      → flip bypassed, attack resolves
-② ChangeMotion (Lua)             → animation frame assigned
-③ VibrationExplosionOnSucceedAttack → detonate current Vibration stacks on target
-④ GiveBuffOnSucceedAttack: Vibration 5/5 → reload 5 stacks for the next coin
+① SuperCoin                              → flip bypassed, attack resolves unconditionally
+② ChangeMotion (Lua)                     → animation frame assigned before the hit renders
+③ VibrationExplosionOnSucceedAttack      → detonates current Vibration stacks on target (fires on hit)
+④ GiveBuffOnSucceedAttack: Vibration 5/5 → applies 5 stacks of Vibration with 5-turn duration (fires on hit)
 ```
 
-Explosion (③) fires before reload (④). The chain across all 9 coins:
+Step ③ fires before step ④ because `abilityScriptList` entries execute in array order. The explosion consumes the stacks that existed before this coin, then step ④ reloads 5 stacks for the next coin to consume.
+
+Result across all 9 coins:
 
 ```
-Coin 0: Explosion (0 stacks) → Vibration 5 applied
-Coin 1: Explosion (5 stacks) → Vibration 5 applied
-Coin 2: Explosion (5 stacks) → Vibration 5 applied
+Coin 0: explode (0 stacks)  → apply Vibration 5
+Coin 1: explode (5 stacks)  → apply Vibration 5
+Coin 2: explode (5 stacks)  → apply Vibration 5
 ...
-Coin 7: Explosion (5 stacks), S6[0] → Vibration 5 applied
-Coin 8: Explosion (5 stacks), S3[0] → Vibration 5 applied + Breath 3 to self
+Coin 7: explode (5 stacks), S6[0]  → apply Vibration 5
+Coin 8: explode (5 stacks), S3[0]  → apply Vibration 5  +  Breath 3 to self
 ```
 
-From coin 1 onward, every explosion fires at maximum stacks.
-
-### 8-5. TIMING Note
-
-All 9 coins are SuperCoins. SuperCoin bypasses the coin flip, so `TIMING:OnCoinToss` never fires on this skill. Animation logic must use `TIMING:ChangeMotion`, which fires for all coins regardless of flip status.
+Coin 0 explodes at 0 stacks because no Vibration was applied before the skill started. From coin 1 onward, every explosion fires at the full 5 stacks loaded by the previous coin.
 
 ---
 
